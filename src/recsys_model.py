@@ -31,6 +31,7 @@ Forward flow
   4. HeadNet  (3-layer MLP) → output score (B, 1)
 """
 
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -44,24 +45,28 @@ from src.Interaction_net import InteractionNet
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 17 categorical features for the normal (per-transaction) path
+# input_dim = max_category_index + 1.
+# Data is 1-indexed (categories run 1 → N), so input_dim must be N+1
+# to keep index N inside the valid range [0, input_dim).
+# Index 0 is reserved as the padding/unknown slot (padding_idx=0).
 EMBEDDING_FEATURES: List[Dict] = [
-    {'name': 'Group4Code',          'input_dim': 246,    'embed_dim': 6},
-    {'name': 'FlavorID',            'input_dim': 28,     'embed_dim': 4},
-    {'name': 'Group3Code',          'input_dim': 59,     'embed_dim': 5},
-    {'name': 'Group2Code',          'input_dim': 34,     'embed_dim': 4},
-    {'name': 'Group1Code',          'input_dim': 15,     'embed_dim': 3},
-    {'name': 'PersonID',            'input_dim': 56_427, 'embed_dim': 16},
-    {'name': 'CustomerSubGroupID',  'input_dim': 41,     'embed_dim': 5},
-    {'name': 'CustomerMainGroupID', 'input_dim': 5,      'embed_dim': 2},
-    {'name': 'OwnerTypeID',         'input_dim': 3,      'embed_dim': 2},
-    {'name': 'CustomerTypeID',      'input_dim': 3,      'embed_dim': 2},
-    {'name': 'DefaultPaymentTypeID','input_dim': 6,      'embed_dim': 3},
-    {'name': 'PathCode',            'input_dim': 1_335,  'embed_dim': 10},
-    {'name': 'ZoneCode',            'input_dim': 300,    'embed_dim': 7},
-    {'name': 'CityCode',            'input_dim': 152,    'embed_dim': 6},
-    {'name': 'StateCode',           'input_dim': 18,     'embed_dim': 3},
-    {'name': 'BranchCode',          'input_dim': 7,      'embed_dim': 3},
-    {'name': 'VisitorEmployeeID',   'input_dim': 363,    'embed_dim': 8},
+    {'name': 'Group4Code',          'input_dim': 247,    'embed_dim': 6},
+    {'name': 'FlavorID',            'input_dim': 29,     'embed_dim': 4},
+    {'name': 'Group3Code',          'input_dim': 60,     'embed_dim': 5},
+    {'name': 'Group2Code',          'input_dim': 35,     'embed_dim': 4},
+    {'name': 'Group1Code',          'input_dim': 16,     'embed_dim': 3},
+    {'name': 'PersonID',            'input_dim': 56_428, 'embed_dim': 16},
+    {'name': 'CustomerSubGroupID',  'input_dim': 42,     'embed_dim': 5},
+    {'name': 'CustomerMainGroupID', 'input_dim': 6,      'embed_dim': 2},
+    {'name': 'OwnerTypeID',         'input_dim': 4,      'embed_dim': 2},
+    {'name': 'CustomerTypeID',      'input_dim': 4,      'embed_dim': 2},
+    {'name': 'DefaultPaymentTypeID','input_dim': 7,      'embed_dim': 3},
+    {'name': 'PathCode',            'input_dim': 1_336,  'embed_dim': 10},
+    {'name': 'ZoneCode',            'input_dim': 301,    'embed_dim': 7},
+    {'name': 'CityCode',            'input_dim': 153,    'embed_dim': 6},
+    {'name': 'StateCode',           'input_dim': 19,     'embed_dim': 3},
+    {'name': 'BranchCode',          'input_dim': 8,      'embed_dim': 3},
+    {'name': 'VisitorEmployeeID',   'input_dim': 364,    'embed_dim': 8},
 ]
 
 # 5 product-group embedding features shared with the shopping-cart path
@@ -348,6 +353,7 @@ class RecSysModel(nn.Module):
             feat['name']: nn.Embedding(
                 num_embeddings=feat['input_dim'],
                 embedding_dim=feat['embed_dim'],
+                padding_idx=0,   # index 0 → zero vector, never updated by grad
             )
             for feat in EMBEDDING_FEATURES
         })
@@ -484,20 +490,32 @@ class RecSysModel(nn.Module):
         """
         emb_feats     = inputs["i1"]            # (B, 17)
         sca_feats     = inputs["i2"]            # (B, 91)
-        scc_emb_feats = inputs["i3"]            # (B, T, 5)
         scc_sca_feats = inputs["i4"]            # (B, T, 5)
         mask          = inputs["i5"].float()    # (B, T, 1)
 
+        # ── Clamp embedding indices ────────────────────────────────────────
+        # i1 (normal path): data is 1-indexed, valid range [1, N].
+        #   After input_dim += 1 fix, all values are in range — clamp is a
+        #   safety net only.
+        # i3 (SCC path): producer uses -1 as the padding sentinel for
+        #   variable-length cart sequences.  The mask (i5) already zeroes
+        #   out padded positions in the attention sum, so the actual
+        #   embedding value at those positions is irrelevant — we just need
+        #   a valid index.  clamp(min=0) maps -1 → 0 (the padding_idx slot,
+        #   which always produces a zero vector).
+        emb_feats_safe     = inputs["i1"].clamp(min=0)          # (B, 17)
+        scc_emb_feats_safe = inputs["i3"].clamp(min=0)          # (B, T, 5)
+
         # ── 1. Embed all normal categorical features ──────────────────────
         embeddeds: List[torch.Tensor] = [
-            self.embedding_tables[EMBEDDING_FEATURES[i]['name']](emb_feats[:, i])
+            self.embedding_tables[EMBEDDING_FEATURES[i]['name']](emb_feats_safe[:, i])
             for i in range(len(EMBEDDING_FEATURES))
         ]
 
         # ── 2. Embed SCC categorical features (shared tables, indices 0-4) ─
         scc_embeddeds: List[torch.Tensor] = [
             self.embedding_tables[SCC_EMBEDDING_FEATURES[i]['name']](
-                scc_emb_feats[:, :, i]
+                scc_emb_feats_safe[:, :, i]
             )
             for i in range(len(SCC_EMBEDDING_FEATURES))
         ]

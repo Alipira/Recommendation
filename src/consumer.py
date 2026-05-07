@@ -64,7 +64,7 @@ class RedisConsumer:
         Seconds to wait between reconnect attempts.
     """
     # FIXME: change the shape to np.int16 after test if nothing happen
-    _SHAPE_DTYPE = np.int32
+    _SHAPE_DTYPE = np.int16
 
     def __init__(
         self,

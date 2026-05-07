@@ -16,6 +16,8 @@ import mlflow.pytorch
 import numpy as np
 import torch
 import torch.nn as nn
+
+from tqdm import tqdm
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
@@ -37,8 +39,8 @@ from src.consumer import data_gen, ConsumerError
 BASE_PATH = Path(__file__).parent.parent
 
 EPOCHS                         = 10
-STEPS_PER_EPOCH                = 278_550
-STEPS_PER_EPOCH_VAL            = 4_500
+STEPS_PER_EPOCH                = 300 #278_550
+STEPS_PER_EPOCH_VAL            = 150
 STEPS_PER_EPOCH_TEST           = 25
 
 INTERACTION_DIM                = 2
@@ -60,7 +62,7 @@ EARLY_STOP_PATIENCE            = 5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MLFLOW_TRACKING_URI = "http://127.0.0.1:5000"
-MLFLOW_EXPERIMENT   = "RecSys Model V1"
+MLFLOW_EXPERIMENT   = "RecSys Model V2"
 
 LOSS_FN = nn.HuberLoss(delta=1.0)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,13 +165,15 @@ def run_epoch(
     total_loss = total_mae = total_mse = 0.0
     n_batches  = 0
 
+    desc = "TRAIN" if training else "VAL"
+    pbar = tqdm(total=max_steps, desc=desc, unit="batch", dynamic_ncols=True)
+
     with torch.set_grad_enabled(training):
         for step, (inputs, target) in enumerate(loader):
             if max_steps is not None and step >= max_steps:
                 break
 
             inputs, target = to_device(inputs, target, device)
-
             preds = model(inputs)                       # (B, 1)
             loss  = loss_fn(preds, target)
 
@@ -185,6 +189,15 @@ def run_epoch(
                 total_mse  += ((preds - target) ** 2).mean().item()
                 n_batches  += 1
 
+            # Live update every batch
+            pbar.set_postfix({
+                "loss": f"{total_loss / n_batches:.4f}",
+                "mae":  f"{total_mae  / n_batches:.4f}",
+                "step": f"{n_batches}/{max_steps}",
+            })
+            pbar.update(1)
+
+    pbar.close()
     denom = max(n_batches, 1)
     return {
         "loss": total_loss / denom,
@@ -232,20 +245,29 @@ def save_plot(history: Dict[str, list], base_path: Path) -> Path:
     return path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
 
-    # ── MLflow ───────────────────────────────────────────────────────────────
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
     # ── Redis stream keys ─────────────────────────────────────────────────────
+
     _, _, _, stream_key, stream_key_val, stream_key_test, _, _ = read_redis_env_vars()
+    missing = {
+        "stream_key":      stream_key,
+        "stream_key_val":  stream_key_val,
+        "stream_key_test": stream_key_test,
+    }
+    none_keys = [k for k, v in missing.items() if not v]
+    if none_keys:
+        raise EnvironmentError(
+            f"The following stream keys are None — check your .env file or "
+            f"environment variables: {none_keys}"
+        )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    logger.info("Building model …")
     model = get_recsys_model(
         interaction_dim=INTERACTION_DIM,
         shopping_cart_interaction_dim=SHOPPING_CART_INTERACTION_DIM,
@@ -267,7 +289,7 @@ def main() -> None:
     # Fires on top of step_scheduler when val_loss plateaus
     plateau_scheduler = ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=EARLY_STOP_PATIENCE,
-        min_lr=LR_MIN, verbose=True,
+        min_lr=LR_MIN,
     )
 
     early_stopping = EarlyStopping(patience=EARLY_STOP_PATIENCE)
@@ -295,7 +317,7 @@ def main() -> None:
         "train_mse":  [], "val_mse":  [],
     }
 
-    with mlflow.start_run(run_name="interaction_net_v1"):
+    with mlflow.start_run(run_name="Recommendation_v_3"):
 
         mlflow.log_params({
             "interaction_dim":               INTERACTION_DIM,
@@ -418,7 +440,7 @@ def main() -> None:
             # Log model & plot regardless of how training ended
             mlflow.pytorch.log_model(
                 model,
-                artifact_path="model",
+                name="model",
                 registered_model_name="RecSysModel",
             )
 
