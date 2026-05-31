@@ -32,10 +32,11 @@ Forward flow
 """
 
 
+from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple
+
 
 from src.Interaction_net import InteractionNet
 
@@ -49,7 +50,7 @@ from src.Interaction_net import InteractionNet
 # Data is 1-indexed (categories run 1 → N), so input_dim must be N+1
 # to keep index N inside the valid range [0, input_dim).
 # Index 0 is reserved as the padding/unknown slot (padding_idx=0).
-EMBEDDING_FEATURES: List[Dict] = [
+EMBEDDING_FEATURES: list[dict] = [
     {'name': 'Group4Code',          'input_dim': 247,    'embed_dim': 6},
     {'name': 'FlavorID',            'input_dim': 29,     'embed_dim': 4},
     {'name': 'Group3Code',          'input_dim': 60,     'embed_dim': 5},
@@ -71,10 +72,10 @@ EMBEDDING_FEATURES: List[Dict] = [
 
 # 5 product-group embedding features shared with the shopping-cart path
 # (same nn.Embedding tables — indices 0-4 of EMBEDDING_FEATURES)
-SCC_EMBEDDING_FEATURES: List[Dict] = EMBEDDING_FEATURES[:5]
+SCC_EMBEDDING_FEATURES: list[dict] = EMBEDDING_FEATURES[:5]
 
 # 91 scalar features for the normal path (order = column order in i2)
-SCALAR_FEATURES: List[str] = [
+SCALAR_FEATURES: list[str] = [
     'NetWeight', '_UnitSalePrice', '_UnitEndCustomerPrice',
     '_CustomerProfitMargin', 'CustomerAge', 'DefaultChequeDuration',
     'RunningSumCurrentlyRejectedChequeAmount', 'RunningSumTotalChequeAmount',
@@ -104,10 +105,10 @@ SCALAR_FEATURES: List[str] = [
 # FieldSpec tuple: (is_normal_path, is_embedding, raw_feature_index)
 # is_normal_path=True  → feature comes from i1 / i2
 # is_normal_path=False → feature comes from i3 / i4  (shopping-cart)
-FieldSpec = Tuple[bool, bool, int]
+FieldSpec = tuple[bool, bool, int]
 
 # ── Main interaction fields (14 groups) ──────────────────────────────────────
-FIELDS: List[Tuple[str, List[FieldSpec]]] = [
+FIELDS: list[tuple[str, list[FieldSpec]]] = [
     ("ProductGroup",  [(True, True, 0), (True, True, 1), (True, True, 2),
                        (True, True, 3), (True, True, 4)]),
     ("Weight",        [(True, False, 0)]),
@@ -143,7 +144,7 @@ FIELDS: List[Tuple[str, List[FieldSpec]]] = [
 # ── Shopping-cart interaction fields (14 groups) ─────────────────────────────
 # These include both normal-path features (broadcast over T) and
 # shopping-cart-path features (per item).
-SCC_FIELDS: List[Tuple[str, List[FieldSpec]]] = [
+SCC_FIELDS: list[tuple[str, list[FieldSpec]]] = [
     ("ProductGroup",          [(True, True, 0), (True, True, 1), (True, True, 2),
                                (True, True, 3), (True, True, 4)]),
     ("Weight",                [(True, False, 0)]),
@@ -179,9 +180,9 @@ SCC_FIELDS: List[Tuple[str, List[FieldSpec]]] = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_field_dim(
-    field_spec: List[FieldSpec],
-    emb_features: List[Dict],
-    scc_emb_features: List[Dict],
+    field_spec: list[FieldSpec],
+    emb_features: list[dict],
+    scc_emb_features: list[dict],
 ) -> int:
     """
     Sum up the feature dimension contributed by each slot in a field spec.
@@ -209,20 +210,14 @@ def _compute_field_dim(
 # SCC Attention Network
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class SCCAttentionNet(nn.Module):
     """
     Item-level attention scorer for the shopping-cart digest.
 
     Input:  scc_digest_tensor  (B, T, scc_digest_dim)
-    Output: attention weights  (B, T, 1)  — softmax over T before returning
-
-    The network learns to score each cart item by its contribution to the
-    recommendation.  A two-layer MLP maps the item's digest vector to a scalar
-    score; softmax over the T dimension produces the final weights.
-
-    LayerNorm is used instead of BatchNorm because the input is sequential
-    (B, T, D) — LayerNorm normalises across the feature dimension for each
-    (batch, timestep) position independently, which is correct for attention.
+            mask               (B, T, 1)   1 = real item, 0 = padding
+    Output: attention weights  (B, T, 1)  — masked softmax over T
     """
 
     def __init__(self, scc_digest_dim: int, dropout: float = 0.2,
@@ -234,9 +229,9 @@ class SCCAttentionNet(nn.Module):
         self.scorer = nn.Sequential(
             nn.Linear(scc_digest_dim, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(negative_slope=negative_slope, inplace=True),
+            nn.LeakyReLU(negative_slope=negative_slope),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, 1),   # → scalar score per item
+            nn.Linear(hidden_dim, 1),
         )
         self._init_weights()
 
@@ -252,23 +247,46 @@ class SCCAttentionNet(nn.Module):
                 nn.init.ones_(layer.weight)
                 nn.init.zeros_(layer.bias)
 
-    def forward(self, scc_digest_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        scc_digest_tensor: torch.Tensor,    # (B, T, scc_digest_dim)
+        mask: torch.Tensor,                  # (B, T, 1)  — FIX 2: mask now received here
+    ) -> torch.Tensor:
         """
         Args:
             scc_digest_tensor: (B, T, scc_digest_dim)
+            mask:              (B, T, 1)  — 1 = real item, 0 = padding
+
         Returns:
-            attention weights:  (B, T, 1)  summing to 1 over dim=1
+            attention weights: (B, T, 1)  summing to 1 over real (non-padded) positions
         """
-        scores = self.scorer(scc_digest_tensor)          # (B, T, 1)
-        return torch.softmax(scores, dim=1)              # softmax over T
+        scores = self.scorer(scc_digest_tensor)             # (B, T, 1)
+
+        # FIX 2 — CRITICAL: apply mask BEFORE softmax.
+        #
+        # Old code (WRONG):
+        #   weights = softmax(scores, dim=1)                # includes padding positions
+        #   out = (weights * digest * mask).sum(dim=1)      # zeros padding after the fact
+        #
+        # Problem: softmax distributes probability over ALL T slots, including padding.
+        # Zeroing after means the surviving weights sum to < 1 (e.g. 0.6 for a 3-of-5
+        # cart), silently shrinking the digest vector for every padded sequence.
+        #
+        # Fix: set padding logits to -inf so softmax assigns them exactly 0 probability.
+        # The remaining weights sum to 1 over real items only — no post-hoc mask needed.
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+        return torch.softmax(scores, dim=1)                 # (B, T, 1), sums to 1 over real items
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Head Network
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_head_net(neck_dim: int, dropout_schedule=(0.3, 0.2, 0.15),
-                    negative_slope: float = 0.01) -> nn.Sequential:
+def _build_head_net(
+    neck_dim: int,
+    dropout_schedule: tuple[float, float, float] = (0.3, 0.2, 0.15),
+    negative_slope: float = 0.01,
+) -> nn.Sequential:
     """
     3-layer MLP that maps the neck vector to a single output score.
 
@@ -280,11 +298,11 @@ def _build_head_net(neck_dim: int, dropout_schedule=(0.3, 0.2, 0.15),
     d2 = int((neck_dim + 1) * 2 / 4)
     d3 = int((neck_dim + 1) * 1 / 4)
 
-    def _block(in_d, out_d, drop):
+    def _block(in_d: int, out_d: int, drop: float) -> list:
         return [
             nn.Linear(in_d, out_d, bias=False),
             nn.BatchNorm1d(out_d),
-            nn.LeakyReLU(negative_slope=negative_slope, inplace=True),
+            nn.LeakyReLU(negative_slope=negative_slope),
             nn.Dropout(p=drop),
         ]
 
@@ -316,21 +334,6 @@ def _build_head_net(neck_dim: int, dropout_schedule=(0.3, 0.2, 0.15),
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RecSysModel(nn.Module):
-    """
-    Full recommendation system model in PyTorch.
-
-    Parameters
-    ----------
-    interaction_dim : int
-        Output dimension per pair in the main InteractionNet.
-    shopping_cart_interaction_dim : int
-        Output dimension per pair in the SCC InteractionNet.
-    residual_embeddings_to_neck : bool
-        If True, concatenate the raw field vectors onto the neck vector
-        (skip-connection from all main fields except SCC digest).
-    residual_SCC_digest_to_neck : bool
-        If True, also concatenate the SCC digest vector onto the neck.
-    """
 
     def __init__(
         self,
@@ -338,22 +341,21 @@ class RecSysModel(nn.Module):
         shopping_cart_interaction_dim: int,
         residual_embeddings_to_neck: bool,
         residual_SCC_digest_to_neck: bool,
+        dropout: float = 0.15,
     ):
         super().__init__()
 
-        self.interaction_dim                = interaction_dim
-        self.shopping_cart_interaction_dim  = shopping_cart_interaction_dim
-        self.residual_embeddings_to_neck    = residual_embeddings_to_neck
-        self.residual_SCC_digest_to_neck    = residual_SCC_digest_to_neck
+        self.interaction_dim               = interaction_dim
+        self.shopping_cart_interaction_dim = shopping_cart_interaction_dim
+        self.residual_embeddings_to_neck   = residual_embeddings_to_neck
+        self.residual_SCC_digest_to_neck   = residual_SCC_digest_to_neck
 
         # ── Embedding tables ─────────────────────────────────────────────────
-        # All 17 normal categorical features.
-        # The first 5 (product-group hierarchy) are SHARED with the SCC path.
         self.embedding_tables = nn.ModuleDict({
             feat['name']: nn.Embedding(
                 num_embeddings=feat['input_dim'],
                 embedding_dim=feat['embed_dim'],
-                padding_idx=0,   # index 0 → zero vector, never updated by grad
+                padding_idx=0,
             )
             for feat in EMBEDDING_FEATURES
         })
@@ -368,30 +370,33 @@ class RecSysModel(nn.Module):
             field_names=[name for name, _ in SCC_FIELDS],
             field_dims=scc_field_dims,
             interaction_dim=shopping_cart_interaction_dim,
+            dropout=dropout,                                # FIX (train.py BUG 3)
         )
-        # scc_digest_dim = num_scc_pairs × shopping_cart_interaction_dim
         self.scc_digest_dim: int = self.scc_interaction_net.output_dim
 
         # ── SCC Attention Net ────────────────────────────────────────────────
-        self.scc_attention_net = SCCAttentionNet(self.scc_digest_dim)
+        self.scc_attention_net = SCCAttentionNet(
+            self.scc_digest_dim,
+            dropout=dropout,
+        )
 
         # ── Main InteractionNet ──────────────────────────────────────────────
         main_field_dims = [
             _compute_field_dim(spec, EMBEDDING_FEATURES, SCC_EMBEDDING_FEATURES)
             for _, spec in FIELDS
-        ] + [self.scc_digest_dim]  # SCC digest is the last field
+        ] + [self.scc_digest_dim]
 
         self.main_interaction_net = InteractionNet(
             field_names=[name for name, _ in FIELDS] + ["SCC_Digest"],
             field_dims=main_field_dims,
             interaction_dim=interaction_dim,
+            dropout=dropout,
         )
 
         # ── Neck & Head ───────────────────────────────────────────────────────
         neck_dim = self.main_interaction_net.output_dim
 
         if residual_embeddings_to_neck:
-            # Sum of all main field dims (excluding SCC_Digest = last entry)
             neck_dim += int(np.sum(self.main_interaction_net.field_dims[:-1]))
 
         if residual_SCC_digest_to_neck:
@@ -405,15 +410,15 @@ class RecSysModel(nn.Module):
         for emb in self.embedding_tables.values():
             nn.init.trunc_normal_(emb.weight, mean=0.0, std=0.05)
 
-    # ── Field tensor builders ─────────────────────────────────────────────────
 
+    # ── Field tensor builders ─────────────────────────────────────────────────
     def _build_scc_field_tensors(
         self,
-        embeddeds: List[torch.Tensor],       # list of (B, d)
+        embeddeds: list[torch.Tensor],       # list of (B, d)
         sca_feats: torch.Tensor,             # (B, 91)
-        scc_embeddeds: List[torch.Tensor],   # list of (B, T, d)
+        scc_embeddeds: list[torch.Tensor],   # list of (B, T, d)
         scc_sca_feats: torch.Tensor,         # (B, T, 5)
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         """
         Build the list of per-field tensors fed into the SCC InteractionNet.
         All tensors returned have shape (B, T, field_dim).
@@ -423,10 +428,10 @@ class RecSysModel(nn.Module):
         receives consistent 3-D inputs.
         """
         T = scc_sca_feats.shape[1]
-        field_tensors: List[torch.Tensor] = []
+        field_tensors: list[torch.Tensor] = []
 
         for _, spec in SCC_FIELDS:
-            parts: List[torch.Tensor] = []
+            parts: list[torch.Tensor] = []
             for is_normal, is_emb, idx in spec:
                 if is_normal:
                     if is_emb:
@@ -452,18 +457,18 @@ class RecSysModel(nn.Module):
 
     def _build_main_field_tensors(
         self,
-        embeddeds: List[torch.Tensor],   # list of (B, d)
+        embeddeds: list[torch.Tensor],   # list of (B, d)
         sca_feats: torch.Tensor,         # (B, 91)
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         """
         Build per-field tensors for the main InteractionNet.
         All tensors have shape (B, field_dim).
         The SCC digest is appended by the caller after this returns.
         """
-        field_tensors: List[torch.Tensor] = []
+        field_tensors: list[torch.Tensor] = []
 
         for _, spec in FIELDS:
-            parts: List[torch.Tensor] = []
+            parts: list[torch.Tensor] = []
             for is_normal, is_emb, idx in spec:
                 # FIELDS contains only normal-path features (is_normal=True always)
                 if is_emb:
@@ -475,45 +480,23 @@ class RecSysModel(nn.Module):
         return field_tensors
 
     # ── Forward ───────────────────────────────────────────────────────────────
-    def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Args:
-            inputs: dict with keys
-              "i1"  (B, 17)     int64   — categorical indices
-              "i2"  (B, 91)     float32 — scalar features
-              "i3"  (B, T, 5)   int64   — cart embedding indices
-              "i4"  (B, T, 5)   float32 — cart scalar features
-              "i5"  (B, T, 1)   float32 — padding mask
+    def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        sca_feats     = inputs["i2"]
+        scc_sca_feats = inputs["i4"]
+        mask          = inputs["i5"].float()
 
-        Returns:
-            Tensor of shape (B, 1) — predicted recommendation score.
-        """
-        emb_feats     = inputs["i1"]            # (B, 17)
-        sca_feats     = inputs["i2"]            # (B, 91)
-        scc_sca_feats = inputs["i4"]            # (B, T, 5)
-        mask          = inputs["i5"].float()    # (B, T, 1)
+        # removed dead `emb_feats` variable
+        emb_feats_safe     = inputs["i1"].clamp(min=0)
+        scc_emb_feats_safe = inputs["i3"].clamp(min=0)
 
-        # ── Clamp embedding indices ────────────────────────────────────────
-        # i1 (normal path): data is 1-indexed, valid range [1, N].
-        #   After input_dim += 1 fix, all values are in range — clamp is a
-        #   safety net only.
-        # i3 (SCC path): producer uses -1 as the padding sentinel for
-        #   variable-length cart sequences.  The mask (i5) already zeroes
-        #   out padded positions in the attention sum, so the actual
-        #   embedding value at those positions is irrelevant — we just need
-        #   a valid index.  clamp(min=0) maps -1 → 0 (the padding_idx slot,
-        #   which always produces a zero vector).
-        emb_feats_safe     = inputs["i1"].clamp(min=0)          # (B, 17)
-        scc_emb_feats_safe = inputs["i3"].clamp(min=0)          # (B, T, 5)
-
-        # ── 1. Embed all normal categorical features ──────────────────────
-        embeddeds: List[torch.Tensor] = [
+        # ── 1. Embed normal categorical features ──────────────────────────
+        embeddeds: list[torch.Tensor] = [
             self.embedding_tables[EMBEDDING_FEATURES[i]['name']](emb_feats_safe[:, i])
             for i in range(len(EMBEDDING_FEATURES))
         ]
 
-        # ── 2. Embed SCC categorical features (shared tables, indices 0-4) ─
-        scc_embeddeds: List[torch.Tensor] = [
+        # ── 2. Embed SCC categorical features ────────────────────────────
+        scc_embeddeds: list[torch.Tensor] = [
             self.embedding_tables[SCC_EMBEDDING_FEATURES[i]['name']](
                 scc_emb_feats_safe[:, :, i]
             )
@@ -524,25 +507,21 @@ class RecSysModel(nn.Module):
         scc_field_tensors = self._build_scc_field_tensors(
             embeddeds, sca_feats, scc_embeddeds, scc_sca_feats
         )
-        # (B, T, scc_digest_dim)
-        scc_digest_tensor = self.scc_interaction_net(scc_field_tensors)
+        scc_digest_tensor = self.scc_interaction_net(scc_field_tensors)   # (B, T, scc_digest_dim)
 
-        # Attention: (B, T, 1) weights → masked weighted sum → (B, scc_digest_dim)
-        scc_att_weights   = self.scc_attention_net(scc_digest_tensor)    # (B, T, 1)
-        scc_digest_vector = (scc_att_weights * scc_digest_tensor * mask).sum(dim=1)
+        scc_att_weights   = self.scc_attention_net(scc_digest_tensor, mask)  # mask applied inside
+        scc_digest_vector = (scc_att_weights * scc_digest_tensor).sum(dim=1) # no * mask here
 
         # ── 4. Main path ──────────────────────────────────────────────────
         main_field_tensors = self._build_main_field_tensors(embeddeds, sca_feats)
-        main_field_tensors.append(scc_digest_vector)   # SCC_Digest field
+        main_field_tensors.append(scc_digest_vector)
 
-        # (B, interaction_output_dim)
         neck_vector = self.main_interaction_net(main_field_tensors)
 
         # ── 5. Residual skip-connections ──────────────────────────────────
-        residual_parts: List[torch.Tensor] = [neck_vector]
+        residual_parts: list[torch.Tensor] = [neck_vector]
 
         if self.residual_embeddings_to_neck:
-            # Concatenate all main field vectors (exclude last = SCC_Digest)
             residual_parts.extend(main_field_tensors[:-1])
 
         if self.residual_SCC_digest_to_neck:
@@ -553,7 +532,6 @@ class RecSysModel(nn.Module):
         # ── 6. Head → score ───────────────────────────────────────────────
         return self.head_net(neck_with_residuals)    # (B, 1)
 
-    # ── Repr ──────────────────────────────────────────────────────────────────
     def __repr__(self) -> str:
         total_params = sum(p.numel() for p in self.parameters())
         trainable    = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -571,7 +549,7 @@ class RecSysModel(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Factory — keeps train.py import unchanged
+# Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_recsys_model(
@@ -579,16 +557,12 @@ def get_recsys_model(
     shopping_cart_interaction_dim: int,
     residual_embeddings_to_neck: bool,
     residual_SCC_digest_to_neck: bool,
+    dropout: float = 0.15,
 ) -> RecSysModel:
-    """
-    Build and return a RecSysModel.
-
-    This function signature is intentionally identical to the original TF
-    version so train.py needs no changes.
-    """
     return RecSysModel(
         interaction_dim=interaction_dim,
         shopping_cart_interaction_dim=shopping_cart_interaction_dim,
         residual_embeddings_to_neck=residual_embeddings_to_neck,
         residual_SCC_digest_to_neck=residual_SCC_digest_to_neck,
+        dropout=dropout,
     )
