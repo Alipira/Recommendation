@@ -1,0 +1,27 @@
+brotli-python==1.0.9
+cloudpickle==3.1.2
+ffmpeg==4.3
+gitpython==3.1.43
+ipython==8.24.0
+libjpeg-turbo==2.0.0
+matplotlib-base==3.8.4
+matplotlib-inline==0.1.7
+mlflow==3.9.0
+mlflow-skinny==3.9.0
+mlflow-ui==3.9.0
+numpy==1.26.4
+numpy-base==1.26.4
+pandas==2.2.1
+pathlib==1.0.1
+pytorch==2.3.0
+pytorch-cuda== 12.1
+pytorch-mutex==1.0
+scikit-learn== 1.4.2
+scipy==1.13.0
+seaborn==0.12.2
+torchaudio==2.3.0
+torchtriton==2.3.0
+torchvision==0.18.0
+tqdm==4.66.4
+typing-extensions==4.11.0
+umap-learn==0.5.12
