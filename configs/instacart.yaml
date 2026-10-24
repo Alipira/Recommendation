@@ -1,0 +1,52 @@
+# Instacart with Qwen3-0.6B. Sized for one RTX 4080 (16 GB).
+# Start with max_users: 20000 to check everything, then remove it for the full run.
+run_dir: runs/instacart
+train_device: cuda:1
+eval_k: 10
+use_vae: true
+reranker_valid_share: 0.05
+rerank_max_train_users: 50000
+
+data:
+  source: instacart
+  path: data/instacart
+  max_users: 20000
+  min_baskets: 3
+  category_col: department
+
+vae:
+  latent_dim: 16
+  epochs: 60
+
+graph:
+  dim: 64
+  n_layers: 3
+  epochs: 100
+  eval_every: 5
+  patience: 3
+  batch_size: 8192
+  eval_k: 20
+
+candidates:
+  n_candidates: 20
+  n_repeat: 8
+
+prompt:
+  max_history: 10
+  max_title_chars: 50
+
+reranker:
+  model_name: Qwen/Qwen3-0.6B
+  dtype: bfloat16
+  lora_r: 16
+  lora_alpha: 32
+  projector_hidden: 512
+  gradient_checkpointing: false
+
+rerank_train:
+  epochs: 2
+  batch_size: 8
+  grad_accum: 4
+  lr: 0.0002
+  eval_every_steps: 200
+  patience: 3

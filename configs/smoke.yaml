@@ -1,0 +1,35 @@
+# Fast end-to-end check on fake data with a tiny random LLM. Runs on CPU in a few minutes.
+# Numbers from the reranker are meaningless here; it only checks the code paths.
+run_dir: runs/smoke
+train_device: cpu
+eval_k: 10
+tiny_llm: true
+
+data:
+  source: synthetic
+  max_users: 400
+
+vae:
+  epochs: 20
+
+graph:
+  dim: 32
+  epochs: 30
+  eval_every: 10
+  batch_size: 1024
+
+candidates:
+  n_candidates: 12
+  n_repeat: 5
+
+reranker:
+  lora_r: 4
+  lora_alpha: 8
+  projector_hidden: 64
+
+rerank_train:
+  epochs: 2
+  batch_size: 8
+  grad_accum: 1
+  lr: 0.001
+  eval_every_steps: 20

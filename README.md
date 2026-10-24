@@ -1,130 +1,133 @@
 # Recommendation
 
-A recommendation system for B2B ordering on ERP data. Given a retailer, a
-product and the retailer's current shopping cart, the model predicts how much
-of that product the retailer will order. Scores are then used to rank products
-for each retailer: what they usually reorder, and new products they are likely
-to want.
+A recommender that turns customers into vectors with a graph network and a
+VAE, and feeds those vectors into a small LLM (Qwen) that picks the best
+products from a short list.
 
-This repo holds the first working model (a PyTorch deep model trained on
-order history). The longer plan, which adds sequence models, a ranker and a
-small language model, is in [docs/roadmap.md](docs/roadmap.md).
-
-## What is in the repo
+It is built for B2B ordering on ERP data (shops reordering from a
+distributor) and is tested first on the public Instacart dataset.
 
 ```
-src/
-  recsys_model.py     the model (embeddings, cart attention, interaction nets, head)
-  Interaction_net.py  pairwise field-interaction block used twice in the model
-  train.py            training loop, weighted Huber loss, MLflow logging
-  consumer.py         reads ready-made batches from Redis Streams
-  loss.py             extra loss functions (not used by train.py right now)
-  training_viz.py     loss curves, predicted-vs-true plots, ROC plot
-  embedding_viz.py    t-SNE / UMAP plots of the learned embeddings
-utils/
-  read_env.py         reads Redis settings from .env or the environment
-docs/
-  architecture.md     how the model works, step by step
-  roadmap.md          where the project is going next
-references/           papers and the research report the design is based on
+ orders ──► customer–product graph ──► LightGCN ──► customer & product vectors
+                                          ▲                    │
+ customer features ──► VAE ──► node features                   │
+                                                               ▼
+                      repeat items + graph top items ──► 20 candidates
+                                                               │
+          prompt: customer token, recent purchases,            ▼
+          each candidate's title + its vector token ──► Qwen3 + LoRA
+                                                               │
+                                                               ▼
+                                                     ranked recommendations
 ```
 
-## How it works, in short
+## How it works
 
-1. **Inputs.** Each sample is one (retailer, product, date) row with
-   17 categorical features (product groups, customer, location, sales visitor, ...),
-   91 numeric features (price, cheque and payment history, recent order volumes
-   for the retailer, its path and its zone, date and holidays), and the
-   products already in the cart.
-2. **Cart summary.** Every cart item is combined with the row's features,
-   passed through an interaction network, and scored by a small attention
-   network. The weighted sum gives one vector that describes the cart.
-3. **Main path.** The row's features are grouped into 14 fields
-   (product, price, customer, geography, payment, RFM, date, ...). The cart
-   vector is added as a 15th field. Every pair of fields gets its own small
-   network, so the model learns how fields work together.
-4. **Head.** A 3-layer MLP turns the result into one score: the predicted
-   `log1p(quantity)`.
-5. **Loss.** Huber loss, weighted so that rare retailer-product pairs and
-   larger orders count more. Plain loss would let frequent, small orders
-   dominate.
+1. **Customer VAE.** Each customer's feature row (order habits, category mix,
+   or your own ERP profile columns) is squeezed into a 16-number vector.
+   Customers with similar habits get similar vectors, and a brand-new customer
+   still gets one from their profile alone.
+2. **LightGCN.** Customers and products are nodes; each purchase is an edge.
+   Every customer starts as `ID vector + projected VAE vector`. Three rounds of
+   neighbour averaging spread "who buys what" through the graph. Trained with
+   BPR loss: bought products should score above random ones.
+3. **Candidates.** For each customer: up to 8 of their own most bought items
+   (shops reorder a lot), filled up to 20 with the graph's top items.
+4. **LLM reranker.** One prompt per customer lists their recent purchases and
+   the 20 candidates by name. The prompt also holds special tokens whose
+   embeddings are replaced by the graph vectors (passed through a small MLP).
+   So Qwen reads both the product names and where each product and customer
+   sits in the purchase graph. The next-token scores for the letters A, B, C,
+   ... rank all candidates in one pass. Only LoRA adapters and the two MLPs
+   are trained; Qwen itself stays frozen.
+5. **Evaluation.** Recall, NDCG and hit rate over the full catalogue, also
+   split into repeat items and new items, against "popular" and "repeat"
+   baselines.
 
 More detail in [docs/architecture.md](docs/architecture.md).
 
-## Data flow
+## Repo layout
 
-Training data is not read from files. A separate producer service builds
-batches from the ERP database and writes them to Redis Streams (one stream each
-for train, validation and test). `consumer.py` reads one message per batch,
-acknowledges and deletes it, and hands the arrays to PyTorch.
-
-Each message contains these arrays, each with `_dtype` and `_shape` entries:
-
-| Key                      | Shape       | Meaning                              |
-|--------------------------|-------------|--------------------------------------|
-| `batch_row_embed`        | (B, 17)     | categorical indices (0 = unknown)    |
-| `batch_row_float`        | (B, 91)     | numeric features                     |
-| `batch_sc_embed`         | (B, T, 5)   | cart item product-group indices      |
-| `batch_sc_float`         | (B, T, 5)   | cart item weight, prices, quantity   |
-| `mask`                   | (B, T, 1)   | 1 = real cart item, 0 = padding      |
-| `batch_labels`           | (B, 1)      | target, `log1p(quantity)`            |
-| `batch_person_frequency` | (B,)        | weight for rare retailer-product pairs |
+```
+hybridrec/
+  data/         data contract, Instacart and ERP loaders, splits, customer features, fake data
+  models/       customer VAE, LightGCN, graph training loop
+  llm/          prompt, reranker (Qwen + LoRA + vector tokens), reranker training
+  eval/         metrics and baselines
+  candidates.py merge repeat and graph candidates
+  retrieval.py  top-K search over graph vectors
+  config.py     YAML config
+  pipeline.py   runs every stage
+configs/        smoke.yaml (fake data), instacart.yaml, erp.yaml
+tests/          pytest suite
+docs/           architecture and roadmap
+references/     papers and the research report
+```
 
 ## Setup
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+pip install torch --index-url https://download.pytorch.org/whl/cu128   # pick your CUDA
 pip install -r requirements.txt
-cp .env.example .env        # then fill in your Redis settings
 ```
 
-Start an MLflow server (training logs to `http://127.0.0.1:5000`):
+Check that everything works (fake data, tiny random LLM, CPU, about a minute):
 
 ```bash
-mlflow server --host 127.0.0.1 --port 5000
+pytest
+python -m hybridrec.pipeline --config configs/smoke.yaml
 ```
 
-Make sure the producer is writing to the three streams, then:
+The smoke run's reranker numbers mean nothing; it only checks the code paths.
+
+## Run on Instacart
+
+1. Download "Instacart Market Basket Analysis" from Kaggle and unzip the CSV
+   files into `data/instacart/`.
+2. Run:
 
 ```bash
-python -m src.train
+python -m hybridrec.pipeline --config configs/instacart.yaml
 ```
 
-Run it from the repo root so the `src.` and `utils.` imports work.
+The config starts with 20,000 customers so a first run is quick. Remove
+`max_users` for the full dataset. Each stage saves its output in `runs/instacart/`,
+so you can rerun one part:
 
-## Debugging bad indices
-
-If training stops with a CUDA "device-side assert", an embedding index is
-usually out of range. Build the model with `check_indices=True`:
-
-```python
-model = get_recsys_model(..., check_indices=True)
+```bash
+python -m hybridrec.pipeline --config configs/instacart.yaml --stages rerank evaluate
 ```
 
-It then checks every batch and tells you which feature has a bad value.
-Turn it off again for normal runs.
+Results are printed and saved to `runs/instacart/metrics.json`.
 
-## Known issues
+## Run on ERP data
 
-These are open questions, not yet changed in the code:
+1. Edit the SQL in `hybridrec/data/erp.py` (`ErpConfig`) to match your tables.
+2. `export ERP_DB_URL="mssql+pyodbc://..."`
+3. To use your CustomerVAE vectors instead of the built-in VAE, export them to
+   parquet (`user_id` + one column per dimension) and set
+   `data.user_vectors` in `configs/erp.yaml`.
+4. `python -m hybridrec.pipeline --config configs/erp.yaml`
 
-- **Output layer ends in ReLU.** If the last layer's input goes negative, the
-  prediction is 0 and no gradient flows back. Softplus would keep the output
-  positive without this problem.
-- **BatchNorm sees cart padding.** In the cart path, padded slots are passed
-  through BatchNorm together with real items, so padding shifts the batch
-  statistics.
-- **Learning-rate step never fires.** `LR_DECAY_STEPS = 100_000`, but a run is
-  10 × 300 = 3,000 steps.
-- **Plateau scheduler and early stopping use the same patience (5),** so early
-  stopping ends the run before the learning rate is ever reduced.
-- **Only regression metrics are tracked** (loss, MAE, MSE). Ranking metrics
-  (Recall@K, NDCG@K on the full catalogue, split by repeat and new items) are
-  the next step; see the roadmap.
-- **Shape dtype.** Array shapes are sent as `int16`, which breaks for any
-  dimension above 32,767. The consumer now accepts a `<field>_shape_dtype`
-  entry, so the producer can switch to `int32` safely.
+## Hardware
+
+Set for 2× RTX 4080 (16 GB). Training runs on `cuda:1` (`train_device` in the
+config), leaving `cuda:0` free for serving. Qwen3-0.6B with LoRA, batch 8 and
+20 candidates fits in 16 GB in bfloat16. For Qwen3-1.7B, turn on
+`gradient_checkpointing`.
+
+## What has and has not been checked
+
+- The full pipeline and all tests run on fake data, with a tiny random Qwen3
+  model built offline.
+- Not yet run with the real Qwen3 weights or on the real Instacart files.
+  The first Instacart run is the real test; see the roadmap for what to look at.
+
+## Old code
+
+The previous quantity-prediction model is kept on the
+[`legacy-quantity-model`](../../tree/legacy-quantity-model) branch.
 
 ## License
 

@@ -1,101 +1,123 @@
-# Model architecture
+# Architecture
 
-This page walks through `src/recsys_model.py` from inputs to output.
+## Data contract
 
-## Inputs
+Every source (Instacart, ERP, fake data) is turned into the same three tables
+(`hybridrec/data/schema.py`):
 
-| Name | Shape      | Type    | Content |
-|------|------------|---------|---------|
-| `i1` | (B, 17)    | int     | categorical indices for the row |
-| `i2` | (B, 91)    | float   | numeric features for the row |
-| `i3` | (B, T, 5)  | int     | product-group indices for each cart item |
-| `i4` | (B, T, 5)  | float   | weight, three prices and quantity for each cart item |
-| `i5` | (B, T, 1)  | float   | 1 for a real cart item, 0 for padding |
+| Table | Columns |
+|-------|---------|
+| interactions | `user_id`, `item_id`, `basket_id`, `ts` (days), `qty` |
+| items | `item_id`, `title`, plus text columns used in prompts (aisle, group, flavour, ...) |
+| users (optional) | `user_id`, plus numeric feature columns |
 
-`B` is the batch size and `T` is the longest cart in the batch.
+`Dataset.validate()` checks it: no unknown items, one user and one time per
+basket, numeric user features. After that point, nothing knows where the data
+came from.
 
-All categorical features use index 0 for "unknown / padding". Real values
-start at 1, so each table has `max_index + 1` rows. The feature lists
-(`EMBEDDING_FEATURES`, `SCALAR_FEATURES`, `FIELDS`, `SCC_FIELDS`) at the top of
-the file are the single source of truth for sizes and order.
+## Splits
 
-## Step 1: embeddings
+Last-basket split: each customer's last basket is test, the one before is
+validation, the rest is training. Customers with fewer than 3 baskets stay in
+training only. A time-cutoff split is also there for a single global "now".
 
-Each of the 17 categorical features has its own embedding table. Sizes are
-small (2 to 16) and grow with the number of values. The five product-group
-features share their tables with the cart path, so "Group4Code = 120" means
-the same thing for the target product and for a product in the cart.
+What each stage may see:
 
-## Step 2: cart summary
+| Stage | Learns from | Checked on |
+|-------|-------------|------------|
+| VAE, LightGCN | train | validation (graph early stopping) |
+| Reranker | validation baskets (the graph never saw them) | 10% of validation customers |
+| Final report | — | test baskets, with train + validation as history |
 
-For every cart item the model builds 15 fields. Some come from the row
-(customer, price, geography, ...) and are copied to every cart position;
-the rest come from the item itself (its product groups, weight, prices,
-quantity).
+## Customer VAE (`models/vae.py`)
 
-An `InteractionNet` mixes these fields (see below) and gives one vector per
-cart item. A small attention network then scores each item. Padding slots
-are set to `-inf` before the softmax, so they get exactly zero weight and the
-real items' weights add up to 1. A cart with no real items gets a zero
-vector instead of NaN.
+Input: one standardised feature row per customer. With no customer table,
+features come from training history: number of baskets, basket size, days
+between orders, repeat share, distinct items, and share of purchases per top
+category.
 
-The weighted sum of item vectors is the **cart digest**: one vector that
-says what is already in the cart.
+Encoder (2 layers, 64 wide) → mean and log-variance (16 dims) → decoder.
+Loss: reconstruction error + β × KL, with β growing from 0 to 0.5 over the
+first 10 epochs so the model learns to reconstruct before it is pushed toward
+a smooth latent space. The mean vector is the customer's output.
 
-## Step 3: main path
+Ready-made CustomerVAE vectors can replace this stage (`data.user_vectors`).
 
-The row's features are grouped into 14 fields:
+## LightGCN (`models/lightgcn.py`)
 
-ProductGroup, Weight, Price, Customer, PaymentMethod, Geographical, Visitor,
-Cheque, Payment, Customer_RFM, Path_RFM, Zone_RFM, Date, Holidays.
+Graph: customers + products as nodes, one edge per (customer, product)
+bought in training. The adjacency is normalised as D^-1/2 A D^-1/2.
 
-The cart digest is added as field 15. A second `InteractionNet` mixes them.
-
-## InteractionNet
-
-For every pair of fields (i, j), with 15 fields that is 105 pairs, a small
-block runs:
+Starting vector of a customer:
 
 ```
-concat(field_i, field_j) → Linear (no bias) → BatchNorm → LeakyReLU → Dropout
-                         → Linear → LeakyReLU
+e0(u) = id_embedding(u) + Linear(vae_vector(u))
 ```
 
-Each block outputs `interaction_dim` numbers. All outputs are joined into one
-vector. This lets the model learn things like "this customer group reacts to
-this price level" directly, instead of hoping one big MLP finds it.
+Each layer replaces every node's vector with the weighted average of its
+neighbours. The final vector is the mean of the starting vector and the 3
+layer outputs. There are no weights inside the layers, which is why LightGCN
+is fast and hard to overfit.
 
-## Step 4: neck and head
+**ID dropout:** in each training step, 10% of nodes lose their ID part and
+must be placed from their features alone. This teaches the feature
+projection to carry real information, which helps new customers.
 
-The neck is the main interaction output, plus (optionally) the raw field
-tensors and the cart digest as skip connections. A 3-layer MLP with widths
-3/4, 2/4 and 1/4 of the neck size gives the final score.
+**Loss:** BPR. For a bought pair (u, i) and a random item j the customer did not
+buy, push `score(u,i) − score(u,j)` up. Plus a small L2 penalty on the starting
+vectors. Early stopping on validation recall@20.
 
-## Training
+## Candidates (`candidates.py`)
 
-- **Target:** `log1p(quantity)`. Order sizes range over several orders of
-  magnitude; the log keeps large orders from taking over.
-- **Loss:** Huber with `delta = 0.3`. On log targets (about 0 to 6), a delta of
-  1 would put most of the error of rare samples in the flat part of the
-  loss, where the gradient is weak.
-- **Weights:** each sample's loss is multiplied by
-  `frequency weight × value weight`, both normalised per batch.
-  - frequency weight = `1 / sqrt(count(retailer, product))`, so rare pairs count more.
-  - value weight = `log1p(quantity) + 1`, so larger orders count more.
-- **Optimizer:** Adam, lr 1e-3, weight decay 1e-3, gradient clipping at 1.0.
-- **Stopping:** early stopping on validation loss; best weights are restored.
-- **Tracking:** MLflow logs parameters, metrics, checkpoints, plots and
-  embedding maps.
+Up to 8 of the customer's own most bought items, then the graph's top items,
+no duplicates, 20 in total. Repeat items are added on purpose: in basket data
+a large share of every next order is reorders, and a "just repeat" baseline is
+very strong (see `references/`). The graph adds the new items.
 
-## Design choices
+The share of held-out items that make it into the 20 candidates is the
+ceiling for the reranker. It is printed as "candidate coverage".
 
-- **No bias before BatchNorm.** BatchNorm removes the mean anyway, so the
-  bias does nothing.
-- **Kaiming initialisation** for layers followed by (Leaky)ReLU.
-- **LayerNorm in the cart attention scorer,** so the score does not depend on
-  how many items are in the batch.
-- **Mask before softmax,** not after. Masking after the softmax leaves real
-  item weights summing to less than 1 and shrinks the cart digest for every
-  padded cart.
-- **Weighted Huber loss** to deal with the imbalance between frequent small
-  orders and rare or large ones.
+## LLM reranker (`llm/`)
+
+**Prompt** (`llm/prompt.py`):
+
+```
+Customer: <|user_vec|>
+Recent purchases, newest first: Milk 1L; Bread; Tea
+Candidates:
+A. Milk 1L <|item_vec|>
+B. Cheddar 200g <|item_vec|>
+...
+Which candidate is the customer most likely to buy next?
+Answer:
+```
+
+**Vector tokens:** `<|user_vec|>` and `<|item_vec|>` are new special tokens.
+After the prompt is turned into embeddings, those positions are overwritten
+with `MLP(graph vector)`. One MLP for customers and one for products, each
+`64 → 512 → hidden size of the LLM` (1024 for Qwen3-0.6B). This is the
+LLaRA idea: the LLM gets the text and the collaborative signal side by side.
+
+**Scoring:** take the LLM's next-token logits at the last position and keep
+only the tokens for "A", "B", "C", ... That gives one score per candidate in a
+single forward pass, with no text generation (the LlamaRec idea). Because
+nothing is generated, the model cannot name a product that is not in the
+list.
+
+**Loss:** a held-out basket can contain several candidates, so the loss is
+`−log(sum of probabilities of all bought candidates)`. Customers with no
+bought item among the candidates are skipped during training.
+
+**What trains:** LoRA (rank 16) on the q, k, v, o projections, and the two
+MLPs. The base Qwen weights stay frozen.
+
+## Evaluation (`eval/`)
+
+- Full catalogue, no sampled negatives.
+- Recall@K, NDCG@K, hit@K, plus recall on repeat items and on new items.
+- Baselines: popular items, and each customer's own most bought items.
+- `paired_bootstrap()` to check that a gain between two models is real.
+
+The report compares: popular, repeat, graph only, merged candidates in their
+original order, and graph + LLM reranker. The reranker is only worth its cost
+if it beats the merged-candidate order and the repeat baseline.

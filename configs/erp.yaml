@@ -1,0 +1,27 @@
+# ERP data from SQL Server. Edit the SQL in hybridrec/data/erp.py (ErpConfig) first,
+# and set the database URL in an environment variable:
+#   export ERP_DB_URL="mssql+pyodbc://user:pass@host/db?driver=ODBC+Driver+18+for+SQL+Server"
+run_dir: runs/erp
+train_device: cuda:1
+eval_k: 10
+use_vae: true
+
+data:
+  source: erp
+  erp_connection_env: ERP_DB_URL
+  min_baskets: 3
+  # Use CustomerVAE vectors instead of training the built-in VAE:
+  # user_vectors: data/customer_vae_vectors.parquet
+
+graph:
+  dim: 64
+  epochs: 100
+  batch_size: 8192
+  eval_k: 20
+
+candidates:
+  n_candidates: 20
+  n_repeat: 10     # shops reorder a lot, so give repeat items more slots
+
+reranker:
+  model_name: Qwen/Qwen3-0.6B
