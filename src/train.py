@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from datetime import datetime
 from tqdm import tqdm
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam
@@ -294,7 +293,7 @@ def save_plot(history: dict[str, list], base_path: Path) -> Path:
     plt.tight_layout()
     out_dir = base_path / "logs" / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"history_{datetime.now()}.png"
+    path = out_dir / f"history_{time.strftime('%Y-%m-%d_%H-%M-%S')}.png"
     plt.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -396,8 +395,6 @@ def main() -> None:
         try:
             for epoch in range(1, EPOCHS + 1):
                 logger.info(f"\n── Epoch {epoch}/{EPOCHS} ──────────────────────")
-                print(f"epoch: {EPOCHS}")
-            
                 train_metrics = run_epoch(
                     model, train_loader, DEVICE,
                     optimizer=optimizer,
@@ -435,7 +432,6 @@ def main() -> None:
                     epoch,
                     STEPS_PER_EPOCH_TEST,
                 )
-                logger.info("Befor log metric in mlflow")    
                 mlflow.log_metrics(
                     {
                         "train_loss": train_metrics["loss"],
@@ -463,11 +459,12 @@ def main() -> None:
         except ConsumerError as exc:
             logger.error(f"Consumer error: {exc}")
             mlflow.set_tag("stopped_reason", f"ConsumerError: {exc}")
-        except Exceptions as exc:
+        except Exception as exc:
             logger.error(f"Training error: {exc}")
             mlflow.set_tag("stopped_reason", f"Exception: {exc}")
 
         finally:
+            epoch = len(history["train_loss"])   # last finished epoch (0 if none)
             early_stopping.restore_best(model)
 
             if stopped_early:
@@ -492,9 +489,11 @@ def main() -> None:
                         "test_mse":  test_metrics["mse"],
                     })
                     logger.info("Generating prediction diagnostic plots …")
+                    # Use the cached test batches. The stream deletes messages after
+                    # reading them, so reading test_loader again would wait forever.
                     viz.visualize_predictions(
                         model,
-                        test_loader,
+                        test_data,
                         epoch,
                         max_batches=STEPS_PER_EPOCH_TEST,
                     )

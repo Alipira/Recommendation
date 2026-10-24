@@ -275,7 +275,12 @@ class SCCAttentionNet(nn.Module):
         # Fix: set padding logits to -inf so softmax assigns them exactly 0 probability.
         # The remaining weights sum to 1 over real items only — no post-hoc mask needed.
         scores = scores.masked_fill(mask == 0, float("-inf"))
-        return torch.softmax(scores, dim=1)                 # (B, T, 1), sums to 1 over real items
+        weights = torch.softmax(scores, dim=1)              # (B, T, 1), sums to 1 over real items
+
+        # A cart with no real items has every logit at -inf, and softmax returns
+        # NaN for it. Those NaNs would spread into the loss. Give such rows zero
+        # weight instead, so their cart digest is a zero vector.
+        return torch.nan_to_num(weights, nan=0.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,8 +347,14 @@ class RecSysModel(nn.Module):
         residual_embeddings_to_neck: bool,
         residual_SCC_digest_to_neck: bool,
         dropout: float = 0.15,
+        check_indices: bool = False,
     ):
         super().__init__()
+
+        # When True, forward() checks every embedding index before lookup and
+        # raises a clear error. Turn it on while debugging data problems; it
+        # costs a little speed.
+        self.check_indices = check_indices
 
         self.interaction_dim               = interaction_dim
         self.shopping_cart_interaction_dim = shopping_cart_interaction_dim
@@ -479,8 +490,35 @@ class RecSysModel(nn.Module):
 
         return field_tensors
 
+    # ── Index check (debug helper) ───────────────────────────────────────────
+    @staticmethod
+    def validate_indices(inputs: dict[str, torch.Tensor]) -> None:
+        """
+        Raise ValueError if any embedding index is outside [0, input_dim).
+
+        An out-of-range index on GPU shows up as a vague "device-side assert"
+        error. This check names the feature and shows the bad values instead.
+        """
+        checks = [
+            ("i1", EMBEDDING_FEATURES,     lambda t, i: t[:, i]),
+            ("i3", SCC_EMBEDDING_FEATURES, lambda t, i: t[:, :, i]),
+        ]
+        for key, features, column in checks:
+            for i, feat in enumerate(features):
+                col = column(inputs[key], i)
+                bad = (col < 0) | (col >= feat["input_dim"])
+                if bad.any():
+                    raise ValueError(
+                        f"[{key}] feature '{feat['name']}' (column {i}): index "
+                        f"outside [0, {feat['input_dim']}). "
+                        f"Examples: {col[bad].tolist()[:5]}"
+                    )
+
     # ── Forward ───────────────────────────────────────────────────────────────
     def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.check_indices:
+            self.validate_indices(inputs)
+
         sca_feats     = inputs["i2"]
         scc_sca_feats = inputs["i4"]
         mask          = inputs["i5"].float()
@@ -558,6 +596,7 @@ def get_recsys_model(
     residual_embeddings_to_neck: bool,
     residual_SCC_digest_to_neck: bool,
     dropout: float = 0.15,
+    check_indices: bool = False,
 ) -> RecSysModel:
     return RecSysModel(
         interaction_dim=interaction_dim,
@@ -565,4 +604,5 @@ def get_recsys_model(
         residual_embeddings_to_neck=residual_embeddings_to_neck,
         residual_SCC_digest_to_neck=residual_SCC_digest_to_neck,
         dropout=dropout,
+        check_indices=check_indices,
     )

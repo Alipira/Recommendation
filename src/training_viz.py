@@ -164,7 +164,7 @@ class TrainingVisualizer:
 
         try:
             with torch.no_grad():
-                for i, (inputs, target) in enumerate(loader):
+                for i, (inputs, target, *_) in enumerate(loader):   # batches also carry freq_weights
                     if max_batches is not None and i >= max_batches:
                         break
 

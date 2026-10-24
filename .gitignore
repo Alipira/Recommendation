@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Training outputs
+models/
+mlruns/
+mlartifacts/
+logs/results/*
+!logs/results/.gitkeep
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

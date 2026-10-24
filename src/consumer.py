@@ -3,13 +3,19 @@ consumer.py
 ───────────
 Redis Stream consumer for the RecSys training pipeline.
 
-Changes vs previous version
-────────────────────────────
-1. _SHAPE_DTYPE upgraded to np.int32 (int16 max = 32 767; silently wraps
-   any dim above that and corrupts every reshape).
-2. generate() now decodes 'batch_freq_weights' from each message and yields
-   a 3-tuple: (inputs_dict, labels, freq_weights).
-3. Health check and empty-poll guard are UN-commented (were disabled).
+Each message holds one ready-made batch. The consumer reads it, acks and
+deletes it, decodes the numpy arrays, and yields
+(inputs_dict, labels, freq_weights).
+
+Notes
+─────
+• Array shapes are sent as raw bytes. Their dtype must match what the
+  producer writes. The producer can send it in a "<field>_shape_dtype"
+  entry; if it does not, SHAPE_DTYPE_DEFAULT (int16) is used. int16 breaks
+  for any dimension above 32 767, so moving both sides to int32 is safer.
+• If the stream stays empty for max_empty_polls polls (~1 s each), the
+  consumer runs a health check and raises ConsumerError instead of
+  waiting forever.
 """
 
 import time
@@ -48,7 +54,9 @@ class RedisConsumer:
     auto_reset_offset  : auto-repair overshot consumer group offset.
     """
 
-    _SHAPE_DTYPE = np.int16   # FIX: was np.int16 — wraps silently above 32 767
+    # Must match the producer. Kept at int16 for compatibility with the current
+    # producer; a per-message "<field>_shape_dtype" entry overrides it.
+    SHAPE_DTYPE_DEFAULT = np.int16
 
     def __init__(
         self,
@@ -214,11 +222,17 @@ class RedisConsumer:
         .copy() ensures the array owns its memory — np.frombuffer returns a
         read-only view and PyTorch will crash trying to take ownership of it.
         """
+        shape_dtype_key = key + b"_shape_dtype"
+        shape_dtype = (
+            np.dtype(data[shape_dtype_key].decode())
+            if shape_dtype_key in data
+            else cls.SHAPE_DTYPE_DEFAULT
+        )
         arr = np.frombuffer(
             data[key],
             dtype=np.dtype(data[key + b"_dtype"].decode()),
         ).reshape(
-            np.frombuffer(data[key + b"_shape"], dtype=cls._SHAPE_DTYPE)
+            np.frombuffer(data[key + b"_shape"], dtype=shape_dtype)
         )
         return arr.copy()
 
@@ -251,12 +265,12 @@ class RedisConsumer:
 
         # Health check on every generate() call — detects overshot offset
         # before the loop starts rather than after a long silent hang.
-        # self._stream_health_check(stream_key)
+        self._stream_health_check(stream_key)
 
         for epoch in range(epochs):
             consumed = 0
             consecutive_errors = 0
-            # empty_polls        = 0
+            empty_polls = 0
 
             while consumed < batches_per_epoch:
 
@@ -283,35 +297,30 @@ class RedisConsumer:
                     time.sleep(self.reconnect_delay_s)
                     continue
 
-                # ── Handle empty response (restored from commented-out FIX 6) ──
+                # ── Handle empty response ──────────────────────────────────
                 if not response:
+                    empty_polls += 1
+
+                    if empty_polls % 30 == 0:
+                        logger.warning(
+                            f"No messages on '{stream_key}' for ~{empty_polls}s "
+                            f"(epoch {epoch+1}/{epochs}, "
+                            f"{consumed}/{batches_per_epoch} consumed). "
+                            f"Waiting for producer …"
+                        )
+
+                    if empty_polls >= self.max_empty_polls:
+                        self._stream_health_check(stream_key)
+                        raise ConsumerError(
+                            f"Stream '{stream_key}' returned no messages for "
+                            f"{empty_polls} polls (~{empty_polls}s). Check that the "
+                            f"producer is running, the stream key matches, and the "
+                            f"group offset is not past the last entry "
+                            f"(fix: XGROUP SETID {stream_key} {self._group_name} 0-0)."
+                        )
                     continue
-                    # empty_polls += 1
 
-                    # if empty_polls % 30 == 0:
-                    #     logger.warning(
-                    #         f"No messages on '{stream_key}' for ~{empty_polls}s "
-                    #         f"(epoch {epoch+1}/{epochs}, "
-                    #         f"{consumed}/{batches_per_epoch} consumed). "
-                    #         f"Waiting for producer …"
-                    #     )
-
-                    # if empty_polls >= self.max_empty_polls:
-                    #     self._stream_health_check(stream_key)
-                    #     raise ConsumerError(
-                    #         f"Stream '{stream_key}' returned no messages for "
-                    #         f"{empty_polls} consecutive polls (~{empty_polls}s).\n"
-                    #         f"Likely causes:\n"
-                    #         f"  1. Producer is not writing to this stream key.\n"
-                    #         f"  2. Group '{self._group_name}' offset overshot — "
-                    #         f"check logs for 'OFFSET OVERSHOT'.\n"
-                    #         f"     Manual fix: XGROUP SETID {stream_key} "
-                    #         f"{self._group_name} 0-0\n"
-                    #         f"  3. Stream key mismatch between producer and consumer."
-                    #     )
-
-                # Got a message — reset empty-poll counter
-                # empty_polls = 0
+                empty_polls = 0
 
                 msg_id = response[0][1][0][0]
                 payload = response[0][1][0][1]
@@ -338,7 +347,6 @@ class RedisConsumer:
                 if self._consumed_counter is not None:
                     self._consumed_counter.labels(stream_key=stream_key).inc()
 
-                # CHANGED: yield 3-tuple (inputs, labels, freq_weights)
                 yield (
                     {
                         "i1": batch_row_embed,
@@ -348,7 +356,7 @@ class RedisConsumer:
                         "i5": mask,
                     },
                     batch_labels,
-                    batch_freq_weights,   # NEW
+                    batch_freq_weights,
                 )
 
 
@@ -373,6 +381,6 @@ def data_gen(
 ) -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]]:
     """
     Wrapper around RedisConsumer.generate().
-    Now yields (inputs_dict, labels, freq_weights) — 3-tuple.
+    Yields (inputs_dict, labels, freq_weights).
     """
     yield from _get_consumer().generate(epochs, stream_key, batches_to_consume_per_epoch)
